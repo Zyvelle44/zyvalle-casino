@@ -1,0 +1,1 @@
+(function(){var ua=navigator.userAgent||'';var mobile=true||/Android|iPhone|iPad|iPod|Mobile/i.test(ua);window.WURFL={is_mobile:mobile,complete_device_name:ua,form_factor:mobile?'Smartphone':'Desktop'};})();

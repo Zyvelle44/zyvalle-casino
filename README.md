@@ -5,7 +5,7 @@
 
 A full-stack casino-style game platform built with React, Vite, Node.js, Express, and MySQL.
 
-[Repository](#) · [Discord Community](#) · [Game Assets](#)
+[Repository](https://github.com/Zyvelle44/zyvalle-casino) · [Discord Community](http://discord.gg/VbuWSHfYm) · [Game Assets](http://discord.gg/VbuWSHfYm)
 
 </div>
 
