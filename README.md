@@ -1,12 +1,13 @@
-::: {align="center"}
+
+<div align="center">
+
 # Zyvalle Casino
 
-**A full-stack casino-style game platform built with React, Vite,
-Node.js, Express, and MySQL.**
+A full-stack casino-style game platform built with React, Vite, Node.js, Express, and MySQL.
 
-[Repository](https://github.com/Zyvelle44/zyvalle-casino) · [Discord
-Community & Game Assets](http://discord.gg/VbuWSHfYm)
-:::
+[Repository](#) · [Discord Community](#) · [Game Assets](#)
+
+</div>
 
 ------------------------------------------------------------------------
 
@@ -402,6 +403,8 @@ automatically grant rights to those materials.
 
 ------------------------------------------------------------------------
 
-::: {align="center"}
+<div align="center">
+
 **Zyvalle Casino** · Built for development and testing.
-:::
+
+</div>
