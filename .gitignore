@@ -1,6 +1,25 @@
-node_modules/
-client/node_modules/
-server/node_modules/
-client/dist/
+# Environment variables and secrets
 .env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Dependencies and generated builds
+node_modules/
+**/node_modules/
+client/dist/
+client/.vite/
+coverage/
+
+# Runtime data and logs
+server/uploads/
+*.log
+logs/
+
+# Local editor / OS files
+.vscode/
+.idea/
 .DS_Store
+Thumbs.db

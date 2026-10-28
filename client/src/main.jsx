@@ -34,19 +34,37 @@ import { ASSET_GAME_CATALOG, ASSET_PROVIDER_CATALOG } from "./asset-catalog.js";
 const API = (
 	import.meta.env.VITE_API_URL || "http://localhost:4000/api"
 ).replace(/\/$/, "");
+let csrfToken = "";
+async function ensureCsrfToken() {
+	if (csrfToken) return csrfToken;
+	const r = await fetch(API + "/auth/csrf", { method: "GET", credentials: "include", cache: "no-store" });
+	const d = await r.json().catch(() => ({}));
+	if (!r.ok || typeof d.csrfToken !== "string" || d.csrfToken.length < 32) {
+		throw new Error("Could not initialize request security. Refresh the page and try again.");
+	}
+	csrfToken = d.csrfToken;
+	return csrfToken;
+}
 async function api(path, opts = {}) {
+	const method = String(opts.method || "GET").toUpperCase();
+	const headers = { ...(opts.headers || {}) };
+	if (opts.body != null && !(opts.body instanceof FormData) && !Object.keys(headers).some((k) => k.toLowerCase() === "content-type")) {
+		headers["Content-Type"] = "application/json";
+	}
+	if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+		headers["X-CSRF-Token"] = await ensureCsrfToken();
+	}
 	const r = await fetch(API + path, {
-		credentials: "include",
-		headers: {
-			"Content-Type": "application/json",
-			...(opts.headers || {}),
-		},
 		...opts,
+		method,
+		credentials: "include",
+		headers,
 	});
-	const d = await r
-		.json()
-		.catch(() => ({ error: "Invalid server response." }));
-	if (!r.ok) throw new Error(d.error || "Request failed");
+	const d = await r.json().catch(() => ({ error: "Invalid server response." }));
+	if (!r.ok) {
+		if (r.status === 403 && /CSRF/i.test(String(d.error || ""))) csrfToken = "";
+		throw new Error(d.error || "Request failed");
+	}
 	return d;
 }
 const money = (n) =>
@@ -682,9 +700,11 @@ function App() {
 		const fd = new FormData(form);
 		try {
 			setBusy(true);
+			const token = await ensureCsrfToken();
 			const r = await fetch(API + "/admin/banners", {
 				method: "POST",
 				credentials: "include",
+				headers: { "X-CSRF-Token": token },
 				body: fd,
 			});
 			const d = await r

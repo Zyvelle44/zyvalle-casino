@@ -1,16 +1,72 @@
 import 'dotenv/config';
+import { randomBytes } from 'node:crypto';
+import {assertRuntimeConfig} from './config.js';
 import express from 'express'; import multer from 'multer'; import path from 'node:path'; import fs from 'node:fs'; import cors from 'cors'; import helmet from 'helmet'; import cookieParser from 'cookie-parser'; import rateLimit from 'express-rate-limit'; import bcrypt from 'bcryptjs'; import {z} from 'zod';
-import {pool,query} from './db.js'; import {cookieOptions,signUser,requireAuth,requireAdmin,optionalAuth} from './security.js';
+import {pool,query} from './db.js'; import {cookieOptions,signUser,requireAuth,requireAdmin,optionalAuth,csrfProtection} from './security.js';
 import {installGatesOfOlympusServer} from './game/gatesOfOlympus.js';
 import {installStarlightPrincessServer} from './game/starlightPrincess.js';
 import {installStarlightChristmasServer} from './game/starlightChristmas.js';
 import {installAztecGemsDeluxeServer} from './game/aztecGemsDeluxe.js';
+assertRuntimeConfig();
 const app=express();
 const bannerDir=path.resolve('uploads','banners'); fs.mkdirSync(bannerDir,{recursive:true});
-const bannerUpload=multer({storage:multer.diskStorage({destination:(req,file,cb)=>cb(null,bannerDir),filename:(req,file,cb)=>cb(null,Date.now()+'-'+Math.random().toString(36).slice(2,10)+path.extname(file.originalname).toLowerCase())}),limits:{fileSize:8*1024*1024},fileFilter:(req,file,cb)=>cb(null,['image/jpeg','image/png','image/webp'].includes(file.mimetype))});
+const bannerUpload=multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1, fields: 10, fieldSize: 16 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = new Set(['image/jpeg', 'image/png', 'image/webp']);
+    if (!allowed.has(file.mimetype)) return cb(new Error('Only JPG, PNG, or WEBP images are allowed.'));
+    cb(null, true);
+  },
+});
+function detectImage(buffer) {
+  if (!Buffer.isBuffer(buffer)) return null;
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return { ext: '.jpg', mime: 'image/jpeg' };
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return { ext: '.png', mime: 'image/png' };
+  if (buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') return { ext: '.webp', mime: 'image/webp' };
+  return null;
+}
+function validBannerLink(value) {
+  if (!value) return true;
+  if (/[\\\\\u0000-\u001f\u007f]/.test(value) || value.startsWith('//')) return false;
+  if (value.startsWith('/')) return true;
+  try { const url = new URL(value); return ['http:', 'https:'].includes(url.protocol) && Boolean(url.hostname); } catch { return false; }
+}
 app.use('/uploads/banners',express.static(bannerDir,{fallthrough:false,maxAge:'1d'}));
-app.disable('x-powered-by'); app.use(helmet({crossOriginResourcePolicy:{policy:'cross-origin'}})); app.use(cors({origin:process.env.CLIENT_ORIGIN||'http://localhost:5173',credentials:true})); app.use(express.json({limit:'32kb'})); app.use(express.urlencoded({extended:false,limit:'64kb'})); app.use(cookieParser());
-app.use('/api/auth',rateLimit({windowMs:15*60*1000,limit:30,standardHeaders:true,legacyHeaders:false}));
+app.disable('x-powered-by');
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(cors({
+  origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
+  credentials: true,
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'X-CSRF-Token'],
+}));
+app.use(express.json({ limit: '32kb', strict: true }));
+app.use(express.urlencoded({ extended: false, limit: '32kb', parameterLimit: 100 }));
+app.use(cookieParser());
+
+const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: true, legacyHeaders: false });
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 12, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many authentication attempts. Try again later.' } });
+const adminLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
+const gameLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many game requests. Please slow down.' } });
+app.use('/api', apiLimiter);
+app.use('/api/auth', authLimiter);
+app.use('/api/admin', adminLimiter);
+app.use('/game', gameLimiter);
+
+app.get('/api/auth/csrf', (req, res) => {
+  const token = randomBytes(32).toString('base64url');
+  res.cookie('zy_csrf', token, {
+    httpOnly: false,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 2 * 60 * 60 * 1000,
+  });
+  res.set('Cache-Control', 'no-store');
+  res.json({ csrfToken: token });
+});
+app.use('/api', csrfProtection);
 const asyncRoute=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);
 async function getUser(id){const rows=await query('SELECT id,name,email,role,status,created_at FROM users WHERE id=? LIMIT 1',[id]);return rows[0]||null;}
 let depositMethodsReady;
@@ -99,8 +155,35 @@ async function ensureGameHistory(){
 app.get('/api/health',asyncRoute(async(req,res)=>{await query('SELECT 1');res.json({status:'ok',service:'Zyvalle Bet API'});}));
 app.get('/api/banners',asyncRoute(async(req,res)=>{const rows=await query("SELECT id,image_url,link_url,sort_order FROM banners WHERE active=1 ORDER BY sort_order ASC,id DESC");res.json({banners:rows});}));
 app.get('/api/admin/banners',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{res.json({banners:await query('SELECT id,image_url,link_url,active,sort_order,created_at FROM banners ORDER BY sort_order ASC,id DESC')});}));
-app.post('/api/admin/banners',requireAuth,requireAdmin,bannerUpload.single('image'),asyncRoute(async(req,res)=>{if(!req.file)return res.status(400).json({error:'Choose a JPG, PNG, or WEBP image up to 8 MB.'});const link=String(req.body.link_url||'').trim();if(link&&!/^https?:\/\//i.test(link)&&!link.startsWith('/')){fs.unlinkSync(req.file.path);return res.status(400).json({error:'Destination URL must be http(s) or an internal path starting with /.'});}const publicOrigin=(process.env.PUBLIC_API_ORIGIN||`http://localhost:${Number(process.env.PORT||4000)}`).replace(/\/$/,'');const imageUrl=`${publicOrigin}/uploads/banners/${req.file.filename}`;const result=await query('INSERT INTO banners(image_url,link_url,active,sort_order) VALUES(?,?,1,0)',[imageUrl,link||null]);res.status(201).json({id:result.insertId,image_url:imageUrl,link_url:link||null,message:'Banner uploaded successfully.'});}));
-app.patch('/api/admin/banners/:id',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{const v=z.object({active:z.boolean().optional(),link_url:z.string().max(500).nullable().optional(),sort_order:z.number().int().min(0).max(9999).optional()}).strict().safeParse(req.body);if(!v.success||!Object.keys(v.data||{}).length)return res.status(400).json({error:'Banner changes are invalid.'});const keys=Object.keys(v.data);await query(`UPDATE banners SET ${keys.map(k=>`${k}=?`).join(',')} WHERE id=?`,[...keys.map(k=>v.data[k]===true?1:v.data[k]===false?0:v.data[k]),Number(req.params.id)]);res.json({message:'Banner updated.'});}));
+app.post('/api/admin/banners', requireAuth, requireAdmin, bannerUpload.single('image'), asyncRoute(async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Choose a JPG, PNG, or WEBP image up to 5 MB.' });
+  const link = String(req.body.link_url || '').trim();
+  if (!validBannerLink(link)) return res.status(400).json({ error: 'Destination URL is invalid.' });
+  const image = detectImage(req.file.buffer);
+  if (!image || image.mime !== req.file.mimetype) return res.status(400).json({ error: 'The uploaded file is not a valid JPG, PNG, or WEBP image.' });
+  const filename = `${randomBytes(24).toString('hex')}${image.ext}`;
+  const target = path.join(bannerDir, filename);
+  await fs.promises.writeFile(target, req.file.buffer, { flag: 'wx', mode: 0o640 });
+  try {
+    const publicOrigin = (process.env.PUBLIC_API_ORIGIN || `http://localhost:${Number(process.env.PORT || 4000)}`).replace(/\/$/, '');
+    const imageUrl = `${publicOrigin}/uploads/banners/${filename}`;
+    const result = await query('INSERT INTO banners(image_url,link_url,active,sort_order) VALUES(?,?,1,0)', [imageUrl, link || null]);
+    res.status(201).json({ id: result.insertId, image_url: imageUrl, link_url: link || null, message: 'Banner uploaded successfully.' });
+  } catch (error) {
+    await fs.promises.unlink(target).catch(() => {});
+    throw error;
+  }
+}));
+app.patch('/api/admin/banners/:id', requireAuth, requireAdmin, asyncRoute(async (req, res) => {
+  const v = z.object({ active: z.boolean().optional(), link_url: z.string().max(500).nullable().optional(), sort_order: z.number().int().min(0).max(9999).optional() }).strict().safeParse(req.body);
+  const id = Number(req.params.id);
+  if (!v.success || !Object.keys(v.data || {}).length || !Number.isSafeInteger(id) || id < 1) return res.status(400).json({ error: 'Banner changes are invalid.' });
+  if (Object.hasOwn(v.data, 'link_url') && v.data.link_url !== null && !validBannerLink(v.data.link_url.trim())) return res.status(400).json({ error: 'Destination URL is invalid.' });
+  const keys = Object.keys(v.data);
+  const result = await query(`UPDATE banners SET ${keys.map(k => `${k}=?`).join(',')} WHERE id=?`, [...keys.map(k => k === 'active' ? (v.data[k] ? 1 : 0) : v.data[k]), id]);
+  if (!result.affectedRows) return res.status(404).json({ error: 'Banner not found.' });
+  res.json({ message: 'Banner updated.' });
+}));
 app.delete('/api/admin/banners/:id',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{const rows=await query('SELECT image_url FROM banners WHERE id=?',[Number(req.params.id)]);if(!rows.length)return res.status(404).json({error:'Banner not found.'});await query('DELETE FROM banners WHERE id=?',[Number(req.params.id)]);const filename=path.basename(new URL(rows[0].image_url).pathname);const target=path.join(bannerDir,filename);if(target.startsWith(bannerDir)&&fs.existsSync(target))fs.unlinkSync(target);res.json({message:'Banner deleted.'});}));
 app.get('/api/games',asyncRoute(async(req,res)=>{await ensureCatalogGameSettings();const category=String(req.query.category||'').slice(0,40);const provider=String(req.query.provider||'').slice(0,100);const q=String(req.query.q||'').slice(0,80);const featured=req.query.featured==='1';const where=["g.status='active'","g.title LIKE ?","(p.active=1 OR p.name IS NULL)"];const params=[`%${q}%`];if(category&&category!=='Lobby'){where.push('g.category=?');params.push(category);}if(provider&&provider!=='All Providers'){where.push('g.provider=?');params.push(provider);}if(featured)where.push('g.featured=1');const limit=featured?500:2000;const rows=await query(`SELECT g.id,g.slug,g.title,g.provider,g.category,g.image_path,g.status,g.featured,g.is_new,CAST(JSON_UNQUOTE(COALESCE(JSON_EXTRACT(s.settings_json,'$.targetRtp'),JSON_EXTRACT(s.settings_json,'$.rtp'),JSON_EXTRACT(s.settings_json,'$.rtpPercent'))) AS DECIMAL(5,2)) AS rtp_percent,CAST(JSON_UNQUOTE(JSON_EXTRACT(s.settings_json,'$.enabled')) AS UNSIGNED) AS settings_enabled,CAST(JSON_UNQUOTE(JSON_EXTRACT(s.settings_json,'$.engineSupported')) AS UNSIGNED) AS engine_supported FROM games g LEFT JOIN providers p ON p.name=g.provider LEFT JOIN slot_game_settings s ON s.game_key=g.slug WHERE ${where.join(' AND ')} ORDER BY g.featured DESC,g.title ASC LIMIT ${limit}`,params);const seen=new Set();const uniqueRows=rows.filter(g=>{const key=[String(g.title||'').trim().toLocaleLowerCase().replace(/[^a-z0-9]+/g,''),String(g.provider||'').trim().toLocaleLowerCase().replace(/[^a-z0-9]+/g,'')].join('::');if(!key||seen.has(key))return false;seen.add(key);return true;});res.json({games:uniqueRows});}));
 app.get('/api/providers',asyncRoute(async(req,res)=>{const rows=await query("SELECT p.name AS provider,p.logo_path,p.active,COUNT(CASE WHEN g.status='active' THEN 1 END) AS game_count FROM providers p JOIN games g ON g.provider=p.name AND g.status='active' WHERE p.active=1 GROUP BY p.name,p.logo_path,p.active HAVING COUNT(g.id)>0 ORDER BY p.name ASC");res.json({providers:rows});}));
@@ -169,5 +252,20 @@ installStarlightPrincessServer(app,{pool,query,optionalAuth,asyncRoute});
 installStarlightChristmasServer(app,{pool,query,optionalAuth,asyncRoute});
 installAztecGemsDeluxeServer(app,{pool,optionalAuth,asyncRoute});
 
-app.use((err,req,res,next)=>{console.error(err);if(err.code==='ER_DUP_ENTRY')return res.status(409).json({error:'This data is already in use.'});res.status(500).json({error:process.env.NODE_ENV==='production'?'A server error occurred.':'Server error. Check the API logs.'});});
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err instanceof multer.MulterError) {
+    const message = err.code === 'LIMIT_FILE_SIZE'
+      ? 'Image exceeds the 5 MB upload limit.'
+      : 'Upload request is invalid.';
+    return res.status(400).json({ error: message });
+  }
+  if (err.message === 'Only JPG, PNG, or WEBP images are allowed.') {
+    return res.status(400).json({ error: err.message });
+  }
+  if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'This data is already in use.' });
+  // Keep stack traces and database details in server logs only.
+  console.error('[api-error]', { name: err.name, code: err.code, message: err.message, path: req.path, method: req.method });
+  res.status(500).json({ error: 'A server error occurred.' });
+});
 const port=Number(process.env.PORT||4000);app.listen(port,()=>console.log(`Zyvalle Bet API running at http://localhost:${port}`));
