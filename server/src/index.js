@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import {assertRuntimeConfig} from './config.js';
 import express from 'express'; import multer from 'multer'; import path from 'node:path'; import fs from 'node:fs'; import cors from 'cors'; import helmet from 'helmet'; import cookieParser from 'cookie-parser'; import rateLimit from 'express-rate-limit'; import bcrypt from 'bcryptjs'; import {z} from 'zod';
 import {pool,query} from './db.js'; import {cookieOptions,signUser,requireAuth,requireAdmin,optionalAuth,csrfProtection} from './security.js';
@@ -39,7 +39,7 @@ app.use(cors({
   origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
   credentials: true,
   methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'X-CSRF-Token'],
+  allowedHeaders: ['Content-Type', 'X-CSRF-Token', 'Idempotency-Key'],
 }));
 app.use(express.json({ limit: '32kb', strict: true }));
 app.use(express.urlencoded({ extended: false, limit: '32kb', parameterLimit: 100 }));
@@ -67,7 +67,42 @@ app.get('/api/auth/csrf', (req, res) => {
   res.json({ csrfToken: token });
 });
 app.use('/api', csrfProtection);
+
 const asyncRoute=fn=>(req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);
+const moneySchema = z.number().finite().min(1).max(100000).refine(
+  value => Math.abs(value * 100 - Math.round(value * 100)) < 1e-7,
+  'Amount must have no more than two decimal places.',
+);
+function amountToCents(value) { return Math.round(value * 100); }
+function centsToAmount(cents) { return (cents / 100).toFixed(2); }
+function makeReference(prefix) { return `${prefix}-${randomUUID().replaceAll('-', '').toUpperCase()}`; }
+function getIdempotencyKey(req) {
+  const key = String(req.get('Idempotency-Key') || '').trim();
+  return /^[A-Za-z0-9._:-]{16,100}$/.test(key) ? key : null;
+}
+async function findIdempotentTransaction(conn, userId, key, type, amountCents) {
+  if (!key) return null;
+  const [rows] = await conn.execute(
+    'SELECT id,reference,type,amount,status FROM transactions WHERE user_id=? AND idempotency_key=? LIMIT 1',
+    [userId, key],
+  );
+  if (!rows.length) return null;
+  if (rows[0].type !== type || amountToCents(Number(rows[0].amount)) !== amountCents) {
+    const error = new Error('Idempotency key was already used for a different request.');
+    error.statusCode = 409;
+    throw error;
+  }
+  return rows[0];
+}
+async function insertLedger(conn, { userId, transactionId = null, entryType, amount, balanceAfter, actorUserId = null, idempotencyKey = null }) {
+  await conn.execute(
+    `INSERT INTO wallet_ledger
+      (user_id, transaction_id, entry_type, amount, balance_after, actor_user_id, idempotency_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [userId, transactionId, entryType, amount, balanceAfter, actorUserId, idempotencyKey],
+  );
+}
+
 async function getUser(id){const rows=await query('SELECT id,name,email,role,status,created_at FROM users WHERE id=? LIMIT 1',[id]);return rows[0]||null;}
 let depositMethodsReady;
 async function ensureDepositMethods(){
@@ -203,11 +238,89 @@ app.get('/api/admin/deposit-methods',requireAuth,requireAdmin,asyncRoute(async(r
 app.patch('/api/admin/deposit-methods/:id',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{await ensureDepositMethods();const schema=z.object({enabled:z.boolean().optional(),instructions:z.string().max(3000).optional(),payment_details:z.string().max(3000).optional(),name:z.string().trim().min(2).max(100).optional(),sort_order:z.number().int().min(0).max(9999).optional()}).strict();const v=schema.safeParse(req.body);if(!v.success||!Object.keys(v.data||{}).length)return res.status(400).json({error:'Deposit method settings are invalid.'});const fields=Object.keys(v.data);const values=fields.map(k=>typeof v.data[k]==='boolean'?(v.data[k]?1:0):v.data[k]);const result=await query(`UPDATE deposit_methods SET ${fields.map(k=>`${k}=?`).join(',')} WHERE id=?`,[...values,Number(req.params.id)]);if(!result.affectedRows)return res.status(404).json({error:'Deposit method not found.'});res.json({message:'Deposit method settings saved.'});}));
 app.get('/api/wallet',requireAuth,asyncRoute(async(req,res)=>{const rows=await query('SELECT balance,currency,updated_at FROM wallets WHERE user_id=?',[req.auth.id]);res.json({wallet:rows[0]||{balance:0,currency:'USD'}});}));
 app.get('/api/transactions',requireAuth,asyncRoute(async(req,res)=>{const rows=await query('SELECT id,reference,type,amount,status,note,created_at FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 100',[req.auth.id]);res.json({transactions:rows});}));
-app.post('/api/wallet/deposit-request',requireAuth,asyncRoute(async(req,res)=>{await ensureDepositMethods();const v=z.object({amount:z.number().min(1).max(100000),method_id:z.number().int().positive(),note:z.string().max(240).optional()}).safeParse(req.body);if(!v.success)return res.status(400).json({error:'Enter a deposit amount between $1.00 and $100,000.00.'});const methods=await query('SELECT id,name,enabled FROM deposit_methods WHERE id=? LIMIT 1',[v.data.method_id]);const method=methods[0];if(!method||!Number(method.enabled))return res.status(400).json({error:'This deposit method is currently disabled. Please choose another method.'});const amount=Math.round(v.data.amount*100)/100;const ref='DEP-'+Date.now().toString(36).toUpperCase()+'-'+Math.random().toString(36).slice(2,7).toUpperCase();const note=[`Method: ${method.name}`,String(v.data.note||'').trim()].filter(Boolean).join(' | ').slice(0,240);await query("INSERT INTO transactions(user_id,reference,type,amount,status,note) VALUES(?,?,'deposit',?,'pending',?)",[req.auth.id,ref,amount,note||'Manual deposit awaiting admin verification']);res.status(201).json({message:'Deposit request submitted. Your USD wallet will be credited after admin approval.',reference:ref});}));
-app.post('/api/wallet/withdraw-request',requireAuth,asyncRoute(async(req,res)=>{const v=z.object({amount:z.number().min(1).max(100000),note:z.string().trim().min(4).max(240)}).safeParse(req.body);if(!v.success)return res.status(400).json({error:'Enter a withdrawal amount between $1.00 and $100,000.00 and valid destination details.'});const amount=Math.round(v.data.amount*100)/100;const conn=await pool.getConnection();try{await conn.beginTransaction();const [ws]=await conn.execute('SELECT balance FROM wallets WHERE user_id=? FOR UPDATE',[req.auth.id]);if(!ws[0]||Number(ws[0].balance)+1e-9<amount){await conn.rollback();return res.status(400).json({error:'Insufficient wallet balance.'});}await conn.execute('UPDATE wallets SET balance=balance-? WHERE user_id=?',[amount,req.auth.id]);const ref='WDR-'+Date.now().toString(36).toUpperCase()+'-'+Math.random().toString(36).slice(2,6).toUpperCase();await conn.execute("INSERT INTO transactions(user_id,reference,type,amount,status,note) VALUES(?,?,'withdrawal',?,'pending',?)",[req.auth.id,ref,amount,v.data.note]);await conn.commit();res.status(201).json({message:'Withdrawal request submitted and reserved from your wallet pending admin review.',reference:ref});}catch(e){await conn.rollback();throw e;}finally{conn.release();}}));
+app.get('/api/wallet/ledger',requireAuth,asyncRoute(async(req,res)=>{const rows=await query('SELECT id,transaction_id,entry_type,amount,balance_after,created_at FROM wallet_ledger WHERE user_id=? ORDER BY id DESC LIMIT 100',[req.auth.id]);res.set('Cache-Control','no-store');res.json({entries:rows});}));
+app.post('/api/wallet/deposit-request',requireAuth,asyncRoute(async(req,res)=>{
+  await ensureDepositMethods();
+  const v=z.object({amount:moneySchema,method_id:z.number().int().positive(),note:z.string().max(240).optional()}).strict().safeParse(req.body);
+  if(!v.success)return res.status(400).json({error:'Enter a deposit amount between $1.00 and $100,000.00 with no more than two decimal places.'});
+  const amountCents=amountToCents(v.data.amount);
+  const amount=centsToAmount(amountCents);
+  const key=getIdempotencyKey(req);
+  const conn=await pool.getConnection();
+  try{
+    await conn.beginTransaction();
+    if(key){
+      const prior=await findIdempotentTransaction(conn,req.auth.id,key,'deposit',amountCents);
+      if(prior){await conn.commit();return res.status(200).json({message:'Deposit request already submitted.',reference:prior.reference,status:prior.status,idempotent:true});}
+    }
+    const [methods]=await conn.execute('SELECT id,name,enabled FROM deposit_methods WHERE id=? LIMIT 1 FOR UPDATE',[v.data.method_id]);
+    const method=methods[0];
+    if(!method||!Number(method.enabled)){await conn.rollback();return res.status(400).json({error:'This deposit method is currently disabled. Please choose another method.'});}
+    const ref=makeReference('DEP');
+    const note=[`Method: ${method.name}`,String(v.data.note||'').trim()].filter(Boolean).join(' | ').slice(0,240);
+    await conn.execute("INSERT INTO transactions(user_id,reference,type,amount,status,note,idempotency_key) VALUES(?,?,'deposit',?,'pending',?,?)",[req.auth.id,ref,amount,note||'Manual deposit awaiting admin verification',key]);
+    await conn.commit();
+    res.status(201).json({message:'Deposit request submitted. Your USD wallet will be credited after admin approval.',reference:ref,status:'pending'});
+  }catch(e){await conn.rollback();if(e.code==='ER_DUP_ENTRY'&&key){const [prior]=await pool.execute('SELECT reference,status,type,amount FROM transactions WHERE user_id=? AND idempotency_key=? LIMIT 1',[req.auth.id,key]);if(prior.length&&prior[0].type==='deposit'&&amountToCents(Number(prior[0].amount))===amountCents)return res.status(200).json({message:'Deposit request already submitted.',reference:prior[0].reference,status:prior[0].status,idempotent:true});}throw e;}finally{conn.release();}
+}));
+app.post('/api/wallet/withdraw-request',requireAuth,asyncRoute(async(req,res)=>{
+  const v=z.object({amount:moneySchema,note:z.string().trim().min(4).max(240)}).strict().safeParse(req.body);
+  if(!v.success)return res.status(400).json({error:'Enter a withdrawal amount between $1.00 and $100,000.00 with no more than two decimal places, and valid destination details.'});
+  const amountCents=amountToCents(v.data.amount);
+  const amount=centsToAmount(amountCents);
+  const key=getIdempotencyKey(req);
+  const conn=await pool.getConnection();
+  try{
+    await conn.beginTransaction();
+    if(key){
+      const prior=await findIdempotentTransaction(conn,req.auth.id,key,'withdrawal',amountCents);
+      if(prior){await conn.commit();return res.status(200).json({message:'Withdrawal request already submitted.',reference:prior.reference,status:prior.status,idempotent:true});}
+    }
+    const [ws]=await conn.execute('SELECT balance FROM wallets WHERE user_id=? FOR UPDATE',[req.auth.id]);
+    if(!ws[0]||Number(ws[0].balance)<Number(amount)){await conn.rollback();return res.status(400).json({error:'Insufficient wallet balance.'});}
+    const [debit]=await conn.execute('UPDATE wallets SET balance=balance-? WHERE user_id=? AND balance>=?',[amount,req.auth.id,amount]);
+    if(debit.affectedRows!==1){await conn.rollback();return res.status(400).json({error:'Insufficient wallet balance.'});}
+    const [afterRows]=await conn.execute('SELECT balance FROM wallets WHERE user_id=?',[req.auth.id]);
+    const ref=makeReference('WDR');
+    const [inserted]=await conn.execute("INSERT INTO transactions(user_id,reference,type,amount,status,note,idempotency_key) VALUES(?,?,'withdrawal',?,'pending',?,?)",[req.auth.id,ref,amount,v.data.note,key]);
+    await insertLedger(conn,{userId:req.auth.id,transactionId:inserted.insertId,entryType:'withdrawal_reserve',amount:`-${amount}`,balanceAfter:afterRows[0].balance,actorUserId:req.auth.id,idempotencyKey:key});
+    await conn.commit();
+    res.status(201).json({message:'Withdrawal request submitted and reserved from your wallet pending admin review.',reference:ref,status:'pending'});
+  }catch(e){await conn.rollback();if(e.code==='ER_DUP_ENTRY'&&key){const [prior]=await pool.execute('SELECT reference,status,type,amount FROM transactions WHERE user_id=? AND idempotency_key=? LIMIT 1',[req.auth.id,key]);if(prior.length&&prior[0].type==='withdrawal'&&amountToCents(Number(prior[0].amount))===amountCents)return res.status(200).json({message:'Withdrawal request already submitted.',reference:prior[0].reference,status:prior[0].status,idempotent:true});}throw e;}finally{conn.release();}
+}));
 app.get('/api/admin/summary',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{const [users]=await query('SELECT COUNT(*) total FROM users');const [pending]=await query("SELECT COUNT(*) total FROM transactions WHERE status='pending'");const [wallets]=await query('SELECT COALESCE(SUM(balance),0) total FROM wallets');const [tx]=await query('SELECT COUNT(*) total FROM transactions');res.json({users:users.total,pending:pending.total,walletBalance:wallets.total,transactions:tx.total});}));
 app.get('/api/admin/transactions',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{const rows=await query('SELECT t.id,t.reference,t.type,t.amount,t.status,t.note,t.created_at,u.name,u.email FROM transactions t JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 200');res.json({transactions:rows});}));
-app.post('/api/admin/transactions/:id/review',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{const v=z.object({decision:z.enum(['approve','reject']),note:z.string().max(240).optional()}).safeParse(req.body);if(!v.success)return res.status(400).json({error:'Invalid decision.'});const conn=await pool.getConnection();try{await conn.beginTransaction();const [rows]=await conn.execute('SELECT * FROM transactions WHERE id=? FOR UPDATE',[Number(req.params.id)]);const t=rows[0];if(!t||t.status!=='pending'){await conn.rollback();return res.status(409).json({error:'Transaction not found or already processed.'});}if(v.data.decision==='approve'&&t.type==='deposit')await conn.execute('UPDATE wallets SET balance=balance+? WHERE user_id=?',[t.amount,t.user_id]);if(v.data.decision==='reject'&&t.type==='withdrawal')await conn.execute('UPDATE wallets SET balance=balance+? WHERE user_id=?',[t.amount,t.user_id]);const status=v.data.decision==='approve'?'approved':'rejected';await conn.execute('UPDATE transactions SET status=?,review_note=?,reviewed_by=?,reviewed_at=NOW() WHERE id=?',[status,v.data.note||null,req.auth.id,t.id]);await conn.commit();res.json({message:`Transaksi ${status}.`});}catch(e){await conn.rollback();throw e;}finally{conn.release();}}));
+app.post('/api/admin/transactions/:id/review',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{
+  const v=z.object({decision:z.enum(['approve','reject']),note:z.string().max(240).optional()}).strict().safeParse(req.body);
+  const id=Number(req.params.id);
+  if(!v.success||!Number.isSafeInteger(id)||id<1)return res.status(400).json({error:'Invalid transaction review request.'});
+  const conn=await pool.getConnection();
+  try{
+    await conn.beginTransaction();
+    const [rows]=await conn.execute('SELECT * FROM transactions WHERE id=? FOR UPDATE',[id]);
+    const t=rows[0];
+    if(!t||t.status!=='pending'){await conn.rollback();return res.status(409).json({error:'Transaction not found or already processed.'});}
+    const [walletRows]=await conn.execute('SELECT balance FROM wallets WHERE user_id=? FOR UPDATE',[t.user_id]);
+    if(!walletRows[0]){await conn.rollback();return res.status(409).json({error:'Wallet not found for this transaction.'});}
+    let balanceAfter=Number(walletRows[0].balance);
+    const amount=centsToAmount(amountToCents(Number(t.amount)));
+    if(v.data.decision==='approve'&&t.type==='deposit'){
+      await conn.execute('UPDATE wallets SET balance=balance+? WHERE user_id=?',[amount,t.user_id]);
+      const [updated]=await conn.execute('SELECT balance FROM wallets WHERE user_id=?',[t.user_id]);
+      balanceAfter=updated[0].balance;
+      await insertLedger(conn,{userId:t.user_id,transactionId:t.id,entryType:'deposit_credit',amount,balanceAfter,actorUserId:req.auth.id});
+    } else if(v.data.decision==='reject'&&t.type==='withdrawal'){
+      await conn.execute('UPDATE wallets SET balance=balance+? WHERE user_id=?',[amount,t.user_id]);
+      const [updated]=await conn.execute('SELECT balance FROM wallets WHERE user_id=?',[t.user_id]);
+      balanceAfter=updated[0].balance;
+      await insertLedger(conn,{userId:t.user_id,transactionId:t.id,entryType:'withdrawal_refund',amount,balanceAfter,actorUserId:req.auth.id});
+    }
+    const status=v.data.decision==='approve'?'approved':'rejected';
+    await conn.execute('UPDATE transactions SET status=?,review_note=?,reviewed_by=?,reviewed_at=NOW() WHERE id=?',[status,v.data.note||null,req.auth.id,t.id]);
+    await conn.commit();
+    res.json({message:`Transaksi ${status}.`});
+  }catch(e){await conn.rollback();throw e;}finally{conn.release();}
+}));
 app.get('/api/admin/users',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{res.json({users:await query('SELECT u.id,u.name,u.email,u.role,u.status,u.created_at,w.balance FROM users u LEFT JOIN wallets w ON w.user_id=u.id ORDER BY u.id DESC LIMIT 200')});}));
 app.patch('/api/admin/users/:id/status',requireAuth,requireAdmin,asyncRoute(async(req,res)=>{const v=z.object({status:z.enum(['active','suspended'])}).safeParse(req.body);if(!v.success)return res.status(400).json({error:'Invalid status.'});if(Number(req.params.id)===req.auth.id&&v.data.status==='suspended')return res.status(400).json({error:'An administrator cannot suspend their own account.'});await query('UPDATE users SET status=? WHERE id=?',[v.data.status,Number(req.params.id)]);res.json({message:'Account status updated.'});}));
 
@@ -254,6 +367,7 @@ installAztecGemsDeluxeServer(app,{pool,optionalAuth,asyncRoute});
 
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
+  if (Number.isInteger(err.statusCode) && err.statusCode >= 400 && err.statusCode < 500) return res.status(err.statusCode).json({ error: err.message });
   if (err instanceof multer.MulterError) {
     const message = err.code === 'LIMIT_FILE_SIZE'
       ? 'Image exceeds the 5 MB upload limit.'

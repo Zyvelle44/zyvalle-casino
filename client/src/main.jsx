@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import {
 	Menu,
@@ -300,6 +300,7 @@ function formatGameTitle(game) {
 		.replace(/\bThe\b/g, "the");
 }
 function App() {
+	const moneyRequestKeys = useRef({});
 	const [sidebarCollapsed, setSidebarCollapsed] = useState(false),
 		[mobileSidebarOpen, setMobileSidebarOpen] = useState(false),
 		[activeGame, setActiveGame] = useState(null),
@@ -808,17 +809,25 @@ function App() {
 	async function requestMoney(type) {
 		setError("");
 		setBusy(true);
+		const payload = {
+			amount: Number(amount),
+			note,
+			...(type === "deposit" ? { method_id: Number(depositMethodId) } : {}),
+		};
+		const signature = JSON.stringify({ type, ...payload });
+		if (!moneyRequestKeys.current[type] || moneyRequestKeys.current[type].signature !== signature) {
+			moneyRequestKeys.current[type] = {
+				signature,
+				key: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`,
+			};
+		}
 		try {
 			const d = await api("/wallet/" + type + "-request", {
 				method: "POST",
-				body: JSON.stringify({
-					amount: Number(amount),
-					note,
-					...(type === "deposit"
-						? { method_id: Number(depositMethodId) }
-						: {}),
-				}),
+				headers: { "Idempotency-Key": moneyRequestKeys.current[type].key },
+				body: JSON.stringify(payload),
 			});
+			delete moneyRequestKeys.current[type];
 			setNotice(d.message);
 			setModal("");
 			setNote("");
