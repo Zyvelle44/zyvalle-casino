@@ -1,3 +1,4 @@
+import { createGameSessionLock } from './sessionLock.js';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -331,7 +332,8 @@ async function loadSession(query, sessionId, userId) {
 async function saveSession(query, sessionId, userId, state) {
   await query('INSERT INTO game_sessions(session_id,user_id,state_json) VALUES(?,?,?) ON DUPLICATE KEY UPDATE state_json=VALUES(state_json),updated_at=CURRENT_TIMESTAMP', [sessionId,userId,JSON.stringify(state)]);
 }
-export function installStarlightChristmasServer(app, {pool, query, optionalAuth, asyncRoute}) {
+export function installStarlightChristmasServer(app, {pool, gameLockPool, query, optionalAuth, asyncRoute}) {
+  const sessionLock = createGameSessionLock(gameLockPool || pool);
   const ensureTables = query(`
     CREATE TABLE IF NOT EXISTS game_sessions (
       session_id VARCHAR(80) PRIMARY KEY,
@@ -519,7 +521,7 @@ export function installStarlightChristmasServer(app, {pool, query, optionalAuth,
     res.json({jackpot:rows[0] || {game_key:key,balance:'0.00',contributed_total:'0.00',updated_at:null}});
   }));
 
-  app.post(['/game/StarlightChristmas/server', '/game/StarlightChristmasM/server'], optionalAuth, asyncRoute(async (req, res) => {
+  app.post(['/game/StarlightChristmas/server', '/game/StarlightChristmasM/server'], sessionLock, optionalAuth, asyncRoute(async (req, res) => {
     await ensureTables;
     if (!req.auth?.id) return response(res, ['responseEvent=error','responseType=','serverResponse=invalid login']);
     const body = parseBody(req.body);
@@ -564,7 +566,9 @@ export function installStarlightChristmasServer(app, {pool, query, optionalAuth,
           const [updated] = await conn.execute('SELECT balance FROM wallets WHERE user_id=?', [req.auth.id]);
           await conn.execute('INSERT INTO game_rounds(session_id,user_id,action,bet,win,balance_after,payload_json) VALUES(?,?,?,?,?,?,?)',
             [sessionId,req.auth.id,'doCollect',0,win,updated[0].balance,JSON.stringify({state})]);
-          await conn.commit();
+          // Persist wallet credit, round history, and session state atomically.
+          // The session advisory lock prevents concurrent requests from reading
+          // the same pendingCollect value while this transaction is in flight.
           // Some game clients send doCollect after a tumble response even when
           // the Free Game feature still has spins remaining. The old unconditional
           // reset erased FreeSpinNumber/FreeSpins here, so the next request became
@@ -572,7 +576,8 @@ export function installStarlightChristmasServer(app, {pool, query, optionalAuth,
           // has actually advanced beyond FreeSpins.
           const freeGameContinues = hasRemainingFreeSpins(state);
           state = preserveFreeSpinsAfterCollect(state);
-          await saveSession(pool.execute.bind(pool),sessionId,req.auth.id,state);
+          await saveSession(conn.execute.bind(conn),sessionId,req.auth.id,state);
+          await conn.commit();
           const collectResponse = [`balance=${fmt(updated[0].balance)}`,`index=${index}`,`balance_cash=${fmt(updated[0].balance)}`,'balance_bonus=0.00','na=s',`stime=${nowMs()}`,'sver=5',`counter=${counter}`];
           if (freeGameContinues) {
             collectResponse.push('fsmul=1', `fsmax=${Number(state.FreeSpins)}`, 'fswin=0.00', `fs=${Number(state.FreeSpinNumber)}`, 'fsres=0.00');
@@ -987,8 +992,10 @@ export function installStarlightChristmasServer(app, {pool, query, optionalAuth,
       }
       await conn.execute('INSERT INTO game_rounds(session_id,user_id,action,bet,win,balance_after,payload_json) VALUES(?,?,?,?,?,?,?)',
         [sessionId,req.auth.id,'doSpin',stake,win.TotalWin,currentBalance,JSON.stringify({request:body,slot,win,state:newState})]);
+      // Commit the wallet debit, round record, and next game state together.
+      // A crash cannot leave a charged spin with the old persisted session state.
+      await saveSession(conn.execute.bind(conn),sessionId,req.auth.id,newState);
       await conn.commit();
-      await saveSession(pool.execute.bind(pool),sessionId,req.auth.id,newState);
       return res.status(200).type('text/plain; charset=utf-8').send(responseText);
     } catch(e) {
       await conn.rollback();

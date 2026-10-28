@@ -1,3 +1,4 @@
+import { createGameSessionLock } from './sessionLock.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -338,7 +339,16 @@ async function logRound(conn, sessionId, userId, action, bet, win, balance, payl
   );
 }
 
-export function installAztecGemsDeluxeServer(app, { pool, optionalAuth, asyncRoute }) {
+export function installAztecGemsDeluxeServer(app, { pool, gameLockPool, optionalAuth, asyncRoute }) {
+  const sessionLock = createGameSessionLock(gameLockPool || pool, {
+    // This engine intentionally derives a stable session when the HTML5 client
+    // sends sessionId=null; match the exact session ID used by the handler.
+    resolveSessionId: (req) => {
+      const requested = String(req.query?.sessionId ?? req.body?.sessionId ?? '').trim();
+      if (requested && requested.toLowerCase() !== 'null') return requested;
+      return req.auth?.id ? `aztec-gems-deluxe-user-${req.auth.id}` : '';
+    },
+  });
   let tablesReady;
   const ensureTablesOnce = () => {
     if (!tablesReady) tablesReady = ensureGameTables(pool).catch((error) => {
@@ -348,7 +358,7 @@ export function installAztecGemsDeluxeServer(app, { pool, optionalAuth, asyncRou
     return tablesReady;
   };
 
-  app.post(['/game/AztecGemsDeluxe/server', '/game/AztecGemsDeluxeM/server'], optionalAuth, asyncRoute(async (req, res) => {
+  app.post(['/game/AztecGemsDeluxe/server', '/game/AztecGemsDeluxeM/server'], optionalAuth, sessionLock, asyncRoute(async (req, res) => {
     const body = formBody(req);
     const action = String(body.action || body.slotEvent || '').trim();
     if (!action) return res.status(200).type('text/plain; charset=utf-8').send('');

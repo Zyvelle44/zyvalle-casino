@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { randomBytes, randomUUID } from 'node:crypto';
 import {assertRuntimeConfig} from './config.js';
 import express from 'express'; import multer from 'multer'; import path from 'node:path'; import fs from 'node:fs'; import cors from 'cors'; import helmet from 'helmet'; import cookieParser from 'cookie-parser'; import rateLimit from 'express-rate-limit'; import bcrypt from 'bcryptjs'; import {z} from 'zod';
-import {pool,query} from './db.js'; import {cookieOptions,signUser,requireAuth,requireAdmin,optionalAuth,csrfProtection} from './security.js';
+import {pool,gameLockPool,query} from './db.js'; import {cookieOptions,signUser,requireAuth,requireAdmin,optionalAuth,csrfProtection} from './security.js';
 import {installGatesOfOlympusServer} from './game/gatesOfOlympus.js';
 import {installStarlightPrincessServer} from './game/starlightPrincess.js';
 import {installStarlightChristmasServer} from './game/starlightChristmas.js';
@@ -360,10 +360,10 @@ app.get('/api/favorites',requireAuth,asyncRoute(async(req,res)=>{const rows=awai
 app.post('/api/favorites',requireAuth,asyncRoute(async(req,res)=>{const v=z.object({game_id:z.number().int().positive()}).safeParse(req.body);if(!v.success)return res.status(400).json({error:'Invalid game.'});const games=await query("SELECT id FROM games WHERE id=? AND status='active' LIMIT 1",[v.data.game_id]);if(!games.length)return res.status(404).json({error:'Game not found or inactive.'});await query('INSERT IGNORE INTO user_favorites(user_id,game_id) VALUES(?,?)',[req.auth.id,v.data.game_id]);res.status(201).json({message:'Game added to favorites.'});}));
 app.delete('/api/favorites/:gameId',requireAuth,asyncRoute(async(req,res)=>{const id=Number(req.params.gameId);if(!Number.isSafeInteger(id)||id<1)return res.status(400).json({error:'Invalid game ID.'});await query('DELETE FROM user_favorites WHERE user_id=? AND game_id=?',[req.auth.id,id]);res.json({message:'Game removed from favorites.'});}));
 
-installGatesOfOlympusServer(app,{pool,query,optionalAuth,asyncRoute});
-installStarlightPrincessServer(app,{pool,query,optionalAuth,asyncRoute});
-installStarlightChristmasServer(app,{pool,query,optionalAuth,asyncRoute});
-installAztecGemsDeluxeServer(app,{pool,optionalAuth,asyncRoute});
+installGatesOfOlympusServer(app,{pool,gameLockPool,query,optionalAuth,asyncRoute});
+installStarlightPrincessServer(app,{pool,gameLockPool,query,optionalAuth,asyncRoute});
+installStarlightChristmasServer(app,{pool,gameLockPool,query,optionalAuth,asyncRoute});
+installAztecGemsDeluxeServer(app,{pool,gameLockPool,optionalAuth,asyncRoute});
 
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
