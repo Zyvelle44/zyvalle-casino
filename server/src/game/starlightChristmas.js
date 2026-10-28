@@ -15,6 +15,7 @@ import { preserveFreeSpinsAfterCollect, hasRemainingFreeSpins } from './starligh
 import BuyFreeSpinsStateLib from './starlightchristmasLib/BuyFreeSpinsState.js';
 import FormatterStateLib from './starlightchristmasLib/FormatterState.js';
 import * as PragmaticLib from './starlightchristmasLib/PragmaticLib.js';
+import { secureRandomIndex } from './secureRandom.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const INIT_LINES = JSON.parse(fs.readFileSync(path.join(here, 'starlight-christmas-init.json'), 'utf8'));
@@ -105,7 +106,7 @@ function spinArea(reelSet, previousState, gameSettings = {}) {
   const below = [];
   for (const reel of reels) {
     if (!reel.length) throw new Error('Reel strip is empty in PHP reference data.');
-    const start = Math.floor(Math.random() * reel.length);
+    const start = secureRandomIndex(reel.length);
     const looped = reel.concat(reel.slice(0, 10));
     const visible = Array.from({length: 5}, (_, i) => looped[(start + i) % looped.length]);
     columns.push(visible);
@@ -213,7 +214,7 @@ function findMultipliers(slotArea, previousState, isFreeSpin, gameSettings = {})
       if (Number(slotArea[position]) !== config.symbol) continue;
       const multiplier = byReel.has(reel)
         ? byReel.get(reel)
-        : config.values[Math.floor(Math.random() * config.values.length)] || 2;
+        : config.values[secureRandomIndex(config.values.length)] || 2;
       found.push({Symbol: config.symbol, Position: position, Multiplier: multiplier, Reel: reel});
     }
   }

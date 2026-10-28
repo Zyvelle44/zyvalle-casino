@@ -7,7 +7,8 @@
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
     "seed:admin": "node src/seed-admin.js",
-    "test:game-lib": "node --test test/gateofolympusLib.test.js"
+    "test:game-lib": "node --test test/gateofolympusLib.test.js",
+    "test:game-rng": "node --test test/game-rng.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
