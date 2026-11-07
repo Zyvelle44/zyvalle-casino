@@ -675,23 +675,27 @@ export function installGatesOfOlympusServer(app, {pool, gameLockPool, query, opt
       const freeSpinRound = isFreeGameSpinActive(state);
       // Base-game multipliers belong to the current tumble chain only.
       // Never reuse multiplier values from a completed previous paid spin.
-      const multiplierHistory = (freeSpinRound || isTumble) ? state : {};
+      // Multiplier history is scoped to one tumble chain. A fresh Free Spin
+      // must not inherit the previous Free Spin multiplier.
+      const multiplierHistory = isTumble ? state : {};
       // A purchased Free Spins feature is represented by its forced-scatter trigger screen.
       // Do not activate/display multiplier symbols on that purchase-trigger screen only;
       // regular spins, natural scatter triggers, and all Free Spins rounds keep existing behavior.
       const currentMultipliers = suppressBuyFsMultipliers
         ? []
         : findMultipliers(slot.SlotArea, multiplierHistory, freeSpinRound, gameSettings);
-      const priorPrgSum = n(state.PrgSum, 0);
-      // The PHP implementation adds PrgSum only once, when the tumble chain
-      // reaches LastRespin. Do not add the same visible multiplier on every tumble.
-      const currentPrg = currentMultipliers.reduce((sum, item) => sum + n(item.Multiplier), 0);
+      // Free Game multiplier bank persists across Free Spins, but is only
+      // applied on a spin whose own tumble chain collects a multiplier.
+      // PrgSum remains scoped to the active tumble chain for compatibility.
+      const featureMultiplierBank = freeSpinRound
+        ? Math.max(0, n(state.FreeGameMultiplierBank, n(state.PrgSum, 0)))
+        : 0;
       // Keep multipliers already collected during this Free Game tumble chain.
       // A lightning orb may disappear from the visible board on the next tumble;
       // that must not reset the accumulated total to zero. A new multiplier on
       // the same reel replaces that reel's current value rather than double-counting it.
       const accumulatedByReel = new Map(
-        ((freeSpinRound || isTumble) && Array.isArray(state.Multipliers) ? state.Multipliers : [])
+        (isTumble && Array.isArray(state.Multipliers) ? state.Multipliers : [])
           .map((item) => [Number(item.Reel), item])
       );
       for (const item of currentMultipliers) {
@@ -713,12 +717,16 @@ export function installGatesOfOlympusServer(app, {pool, gameLockPool, query, opt
       else delete newState.SuppressBuyFsMultipliers;
       if (freeSpinRound || (!freeSpinRound && (isTumble || win.TotalWin > 0))) {
         newState.Multipliers = accumulatedMultipliers;
-        // Free Game commits PrgSum at chain end. Base game keeps only the
-        // multiplier symbols collected in this paid spin's tumble chain.
-        newState.PrgSum = freeSpinRound ? priorPrgSum : 0;
+        // PrgSum tracks only the current tumble chain. The feature bank is
+        // separate and survives multiplier-free Free Spins.
+        newState.PrgSum = freeSpinRound
+          ? accumulatedMultipliers.reduce((sum, item) => sum + Math.max(0, n(item.Multiplier, 0)), 0)
+          : 0;
+        newState.FreeGameMultiplierBank = freeSpinRound ? featureMultiplierBank : 0;
       } else if (!freeSpinRound) {
         newState.Multipliers = [];
         newState.PrgSum = 0;
+        newState.FreeGameMultiplierBank = 0;
       }
       const priorTumbleWin = isTumble ? n(state.TumbleWin, n(state.TotalWin,0)) : 0;
       const priorGameTotal = freeSpinRound ? n(state.TotalWin,0) : 0;
@@ -760,7 +768,7 @@ export function installGatesOfOlympusServer(app, {pool, gameLockPool, query, opt
       } else if (scatter?.FreeSpins) {
         const accumulated = freeSpinRound ? n(state.TotalWin,0) : 0;
         const pending = freeSpinRound ? n(state.pendingCollect,0) : 0;
-        newState = {...newState, State:'Spin', TumbleWin:0, FreeState:'FirstFreeSpin', FreeSpins:scatter.FreeSpins, FreeSpinNumber:1, FSPay:scatter.Pay, Scatter:1, ScatterPositions:scatter.ScatterPositions, TotalWin:Math.round((accumulated+scatter.Pay)*100)/100, Win:0, WinLines:[], pendingCollect:Math.round((pending+scatter.Pay)*100)/100};
+        newState = {...newState, State:'Spin', TumbleWin:0, FreeState:'FirstFreeSpin', FreeSpins:scatter.FreeSpins, FreeSpinNumber:1, FreeGameMultiplierBank:0, FSPay:scatter.Pay, Scatter:1, ScatterPositions:scatter.ScatterPositions, TotalWin:Math.round((accumulated+scatter.Pay)*100)/100, Win:0, WinLines:[], pendingCollect:Math.round((pending+scatter.Pay)*100)/100};
       } else if (scatter?.add) {
         newState = {...newState, State:'Spin', TumbleWin:0, FreeSpins:n(state.FreeSpins,15)+scatter.add, FreeSpinNumber:n(state.FreeSpinNumber,0)+1, FreeState:'AddFreeSpin', TotalWin:n(state.TotalWin,0), Win:0, WinLines:[], pendingCollect:n(state.pendingCollect,0)};
       } else {
@@ -791,6 +799,7 @@ export function installGatesOfOlympusServer(app, {pool, gameLockPool, query, opt
             ...newState,
             State: 'Spin',
             FreeState: 'FirstFreeSpin',
+            FreeGameMultiplierBank: 0,
             FreeSpins: n(queued.FreeSpins, n(gameSettings.settingsFs, 15)),
             FreeSpinNumber: 1,
             FSPay: scatterPay,
@@ -837,7 +846,15 @@ export function installGatesOfOlympusServer(app, {pool, gameLockPool, query, opt
         // enforce the 5000x total-bet cap against the complete Free Game total,
         // not merely against this tumble's raw payout.
         const baseTumbleWin = Math.max(0, priorTumbleWin);
-        const finalPrgSum = priorPrgSum + currentPrg;
+        const chainMultiplier = accumulatedMultipliers.reduce(
+          (sum, item) => sum + Math.max(0, n(item.Multiplier, 0)), 0
+        );
+        // Apply the feature's accumulated multiplier bank only when this
+        // Free Spin itself collected a multiplier. Multiplier-free spins pay
+        // their raw win while leaving the bank untouched for a later spin.
+        const finalPrgSum = chainMultiplier > 0
+          ? featureMultiplierBank + chainMultiplier
+          : 0;
         const settled = settleFreeGameTumble({
           sessionTotal:n(state.TotalWin, priorTumbleWin),
           tumbleWin:baseTumbleWin,
@@ -851,9 +868,12 @@ export function installGatesOfOlympusServer(app, {pool, gameLockPool, query, opt
         newState.pendingCollect = Math.round((Math.max(0, previousPending - baseTumbleWin) + settled.paidTumbleWin + Number.EPSILON) * 100) / 100;
         if (finalPrgSum > 0) newState.MultWin = settled.paidTumbleWin;
         maxWinReached = settled.maxWinReached;
-        // Commit only once at chain end, so subsequent free spins don't reset
-        // or double-count the same multiplier values.
-        newState.PrgSum = finalPrgSum;
+        // Commit the feature bank once at chain end. Do not consume it on a
+        // multiplier-free spin; add the current chain total only when present.
+        if (chainMultiplier > 0) {
+          newState.FreeGameMultiplierBank = finalPrgSum;
+        }
+        newState.PrgSum = chainMultiplier;
       } else if (!freeSpinRound && tumbleEnded) {
         // Base-game multiplier values are fixed when first collected and are
         // summed once at the end of the tumble chain, never rerolled per tumble.
@@ -943,11 +963,19 @@ export function installGatesOfOlympusServer(app, {pool, gameLockPool, query, opt
         tumble:win.TotalWin>0&&isTumble,lastTumble:win.TotalWin===0&&isTumble,freeState,scatter:maxWinReached ? null : (triggeredFeature || (win.TotalWin===0 ? scatter : null))
       });
       const multiplierResponse = serializeMultipliers(currentMultipliers);
-      // Match the PHP LogAndServer protocol: accv reflects PrgSum only.
-      // Do not derive it from state.Multipliers, which may contain multiplier
-      // entries retained from earlier tumble screens and would inflate the
-      // visual TOTAL MULTIPLIER meter before the chain is committed.
-      const responseAccv = n(newState.PrgSum, 0);
+      // accv is the Free Game's cumulative multiplier meter, not merely
+      // the current tumble's PrgSum. While a winning tumble chain is active,
+      // show the previous bank plus this chain's multiplier. Once the chain
+      // ends, its multiplier has already been committed to the bank, so do
+      // not add PrgSum again. A multiplier on a non-winning spin is not banked.
+      const currentChainMultiplier = n(newState.PrgSum, 0);
+      const responseAccv = freeSpinRound
+        ? (tumbleEnded
+            ? n(newState.FreeGameMultiplierBank, featureMultiplierBank)
+            : (win.TotalWin > 0 && currentChainMultiplier > 0
+                ? featureMultiplierBank + currentChainMultiplier
+                : featureMultiplierBank))
+        : currentChainMultiplier;
       if (currentMultipliers.length) {
         // Match PHP LogAndServer: replace the base prg=1 field with the sum
         // of multipliers visible on this response, never append a duplicate prg.
